@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/main.tsx","./src/game/engine.ts","./src/game/types.ts","./src/globe/GlobeView.tsx","./src/store/LocalStore.ts","./src/store/SupabaseStore.ts","./src/ui/HUD.tsx","./src/ui/MainMenu.tsx","./src/ui/Panels.tsx"],"errors":true,"version":"5.9.3"}
