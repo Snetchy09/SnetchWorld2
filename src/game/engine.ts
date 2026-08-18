@@ -1,4 +1,5 @@
-import type { BuildingType, GameState, Player, CountryState, CountryDef } from './types';
+import type { BuildingType, GameState, Player, CountryState, CountryDef, LandParcel } from './types';
+import { tickBusinesses } from './businessEngine';
 import tilesData from '../data/tiles.json';
 import countriesData from '../data/countries.json';
 
@@ -33,6 +34,7 @@ export const TICK_INTERVAL_MS = 45000;
 
 export const COSTS: Record<BuildingType, { gold: number; resources?: number }> = {
   house:   { gold: 50 },
+  home:    { gold: 0 },
   farm:    { gold: 40 },
   factory: { gold: 120, resources: 20 },
   store:   { gold: 80 },
@@ -43,6 +45,7 @@ export const UPGRADE_COST_MULT = 2.2;
 
 export const PRODUCTION: Record<BuildingType, { gold?: number; food?: number; resources?: number; pop?: number; consumes?: { food?: number; resources?: number } }> = {
   house:   { pop: 4 },
+  home:    { pop: 6 },
   farm:    { food: 6 },
   factory: { gold: 10, consumes: { resources: 2, food: 1 } },
   store:   { gold: 4 },
@@ -75,6 +78,9 @@ export function newGameState(): GameState {
     market: { food: 2.0, resources: 3.0, updatedTick: 0 },
     tileOwner: {},
     tilePrice: {},
+    parcels: {},
+    businesses: {},
+    staff: {},
   };
 }
 
@@ -312,6 +318,8 @@ export function runTick(state: GameState): GameState {
     }
   }
 
+  tickBusinesses(s);
+
   s.market.food = Math.max(0.5, Math.min(5, s.market.food + (Math.random() - 0.5) * 0.3));
   s.market.resources = Math.max(0.5, Math.min(6, s.market.resources + (Math.random() - 0.5) * 0.4));
   s.market.updatedTick = s.tick;
@@ -333,9 +341,94 @@ export function ensureCountriesPresent(state: GameState): void {
 
 export function makePlayer(name: string, color: string, isAI = false): Player {
   return {
-    id: uid('p'), name, color, gold: 300, food: 50, resources: 30,
+    id: uid('p'), name, color, gold: 500, food: 80, resources: 50,
     population: 10, isAI, lastTickAt: Date.now(), createdAt: Date.now(),
+    spawnCountryId: null, parcelId: null,
   };
+}
+
+/** Generate an organic small land parcel within a country (6–10 contiguous tiles). */
+export function generateStarterParcel(
+  state: GameState,
+  countryId: string,
+  ownerId: string,
+  playerName: string,
+): LandParcel | null {
+  const countryTiles = TILES.filter(t => t.country === countryId && !state.tileOwner[t.id]);
+  if (countryTiles.length < 6) return null;
+
+  const seedIdx = Math.floor(Math.random() * countryTiles.length);
+  const seed = countryTiles[seedIdx];
+  const targetSize = 6 + Math.floor(Math.random() * 5);
+  const owned = new Set<number>([seed.id]);
+  const frontier = [seed.id];
+
+  while (owned.size < targetSize && frontier.length > 0) {
+    const cur = frontier.splice(Math.floor(Math.random() * frontier.length), 1)[0];
+    const ns = getNeighbours(cur).filter(nid => {
+      const nt = getTile(nid);
+      return nt && nt.country === countryId && !state.tileOwner[nid] && !owned.has(nid);
+    });
+    for (const n of ns) {
+      if (owned.size >= targetSize) break;
+      if (Math.random() > 0.35) {
+        owned.add(n);
+        frontier.push(n);
+      }
+    }
+    if (frontier.length === 0 && owned.size < targetSize) {
+      for (const n of getNeighbours(cur)) {
+        const nt = getTile(n);
+        if (nt && nt.country === countryId && !state.tileOwner[n] && !owned.has(n)) {
+          owned.add(n);
+          frontier.push(n);
+          if (owned.size >= targetSize) break;
+        }
+      }
+    }
+  }
+
+  const tileIds = [...owned];
+  let sumLat = 0, sumLng = 0;
+  for (const tid of tileIds) {
+    const t = getTile(tid);
+    if (t) { sumLat += t.lat; sumLng += t.lng; }
+    state.tileOwner[tid] = ownerId;
+    state.tilePrice[tid] = 0;
+  }
+
+  const def = COUNTRIES.find(c => c.id === countryId);
+  const parcel: LandParcel = {
+    id: uid('parcel'),
+    ownerId,
+    countryId,
+    name: `${playerName}'s Land`,
+    tileIds,
+    centerLat: sumLat / tileIds.length,
+    centerLng: sumLng / tileIds.length,
+    createdAt: Date.now(),
+  };
+  state.parcels[parcel.id] = parcel;
+  return parcel;
+}
+
+export function parcelOfPlayer(state: GameState, playerId: string): LandParcel | null {
+  const p = state.players[playerId];
+  if (!p?.parcelId) return null;
+  return state.parcels[p.parcelId] || null;
+}
+
+export function tilesInParcel(state: GameState, parcelId: string): number[] {
+  return state.parcels[parcelId]?.tileIds || [];
+}
+
+export function playerOwnsTile(state: GameState, playerId: string, tileId: number): boolean {
+  const parcel = parcelOfPlayer(state, playerId);
+  return parcel ? parcel.tileIds.includes(tileId) : false;
+}
+
+export function businessesOnTile(state: GameState, tileId: number) {
+  return Object.values(state.businesses).filter(b => b.tileId === tileId);
 }
 
 export function makeCountryState(countryId: string, leaderId: string | null = null): CountryState {

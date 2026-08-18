@@ -1,20 +1,22 @@
 import type {
   DataStore, GameState, Player, BuildingType, TradeOffer,
-  PlayerSummary, CountrySummary,
+  PlayerSummary, CountrySummary, DoCommand, DoVerb,
 } from '../game/types';
 import {
   newGameState, runTick, ensureCountriesPresent, makePlayer, makeCountryState,
-  uid, TILES, COUNTRIES, COSTS, UPGRADE_COST_MULT, tilePriceFor, tilesOwnedBy,
-  contiguousGroups, TOWN_THRESHOLD, WAR_COST, PROJECTS, countryOfPlayer,
-  computeLeaderboards, baseTilePrice, buildingsOnTile, PRODUCTION,
-  getNeighbours, getTile,
+  uid, TILES, COUNTRIES, COSTS, UPGRADE_COST_MULT, tilesOwnedBy,
+  contiguousGroups, WAR_COST, PROJECTS,
+  computeLeaderboards, buildingsOnTile, PRODUCTION,
+  getNeighbours, getTile, generateStarterParcel, parcelOfPlayer,
+  playerOwnsTile, businessesOnTile,
 } from '../game/engine';
+import { makeBusiness, makeStaff, addCommandToStaff } from '../game/businessEngine';
 
-const STORAGE_KEY = 'territoria_solo_state_v1';
+const STORAGE_KEY = 'territoria_solo_state_v2';
 const PLAYER_KEY = 'territoria_solo_player_v1';
 
-const AI_NAMES = ['Aria','Borin','Cael','Dara','Elin','Faro','Gwen','Halo','Iris','Jor','Kira','Lorn','Mira','Nyx','Orin','Pax','Quill','Rune','Sera','Tarn','Ursa','Vex','Wren','Xan','Yara','Zane'];
-const AI_COLORS = ['#e63946','#2a9d8f','#e9c46a','#f4a261','#588157','#a98467','#bc6c25','#118ab2','#06d6a0','#fb5607'];
+const AI_NAMES = ['Aria','Borin','Cael','Dara','Elin','Faro','Gwen','Halo','Iris','Jor','Kira','Lorn'];
+const AI_COLORS = ['#e63946','#2a9d8f','#e9c46a','#f4a261','#588157','#a98467','#bc6c25','#118ab2'];
 
 export class LocalStore implements DataStore {
   mode = 'solo' as const;
@@ -22,14 +24,24 @@ export class LocalStore implements DataStore {
   private subs = new Set<(s: GameState) => void>();
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private aiTimer: ReturnType<typeof setInterval> | null = null;
-
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor() {
     this.state = this.load();
     ensureCountriesPresent(this.state);
+    this.migrateState();
     this.save();
     this.startTicks();
+  }
+
+  private migrateState() {
+    if (!this.state.parcels) this.state.parcels = {};
+    if (!this.state.businesses) this.state.businesses = {};
+    if (!this.state.staff) this.state.staff = {};
+    for (const p of Object.values(this.state.players)) {
+      if (p.spawnCountryId === undefined) p.spawnCountryId = null;
+      if (p.parcelId === undefined) p.parcelId = null;
+    }
   }
 
   private load(): GameState {
@@ -56,48 +68,27 @@ export class LocalStore implements DataStore {
   }
 
   private seedAI(s: GameState) {
-    // Create ~12 AI players each owning a few tiles in random countries
     const rng = (n: number) => Math.floor(Math.random() * n);
-    for (let i = 0; i < 12; i++) {
-      const name = AI_NAMES[i % AI_NAMES.length] + '_' + i;
+    for (let i = 0; i < 8; i++) {
+      const name = AI_NAMES[i % AI_NAMES.length];
       const color = AI_COLORS[i % AI_COLORS.length];
       const p = makePlayer(name, color, true);
-      p.gold = 200 + rng(300);
+      p.gold = 400 + rng(200);
       s.players[p.id] = p;
-      // claim 2-5 tiles in a random country
       const country = COUNTRIES[rng(COUNTRIES.length)];
-      const ct = TILES.filter(t => t.country === country.id);
-      const n = 2 + rng(4);
-      for (let j = 0; j < n && j < ct.length; j++) {
-        const tile = ct[rng(ct.length)];
-        if (tile && !s.tileOwner[tile.id]) {
-          s.tileOwner[tile.id] = p.id;
-          s.tilePrice[tile.id] = baseTilePrice(country.id);
-          // build a house + farm
-          s.buildings[uid('b')] = { id: uid('b'), tileId: tile.id, ownerId: p.id, type: 'house', level: 1, createdAt: Date.now() };
-        }
-      }
-    }
-    // Make one AI a country leader for demo
-    const aiIds = Object.keys(s.players).filter(id => s.players[id].isAI);
-    if (aiIds.length) {
-      const lead = aiIds[0];
-      // find country where this AI has most tiles
-      const owned = tilesOwnedBy(s, lead);
-      if (owned.length) {
-        const t = TILES.find(x => x.id === owned[0]);
-        if (t) {
-          s.countries[t.country].leaderId = lead;
-          s.countries[t.country].militaryStrength = 60;
-          s.countries[t.country].treasury = 500;
-        }
+      const parcel = generateStarterParcel(s, country.id, p.id, name);
+      if (parcel) {
+        p.spawnCountryId = country.id;
+        p.parcelId = parcel.id;
+        const homeTile = parcel.tileIds[0];
+        s.buildings[uid('b')] = { id: uid('b'), tileId: homeTile, ownerId: p.id, type: 'home', level: 1, createdAt: Date.now(), parcelId: parcel.id };
       }
     }
   }
 
   private startTicks() {
     this.tickTimer = setInterval(() => { this.runTickAndNotify(); }, 45000);
-    this.aiTimer = setInterval(() => { this.runAI(); }, 20000);
+    this.aiTimer = setInterval(() => { this.runAI(); }, 25000);
   }
 
   private runTickAndNotify() {
@@ -112,45 +103,16 @@ export class LocalStore implements DataStore {
     let changed = false;
     for (const p of Object.values(this.state.players)) {
       if (!p.isAI) continue;
-      const owned = tilesOwnedBy(this.state, p.id);
-      if (owned.length < 8 && p.gold > 150) {
-        // try to claim a neighbour tile
-        const groups = contiguousGroups(this.state, p.id);
-        if (groups.length) {
-          const group = groups[0];
-          for (const tid of group) {
-            const t = getTile(tid);
-            if (!t) continue;
-            const candidates = getNeighbours(tid).filter(nid => {
-              const nt = getTile(nid);
-              return nt && nt.country === t.country && !this.state.tileOwner[nid];
-            });
-            if (candidates.length) {
-              const pick = candidates[Math.floor(Math.random()*candidates.length)];
-              const price = tilePriceFor(this.state, pick);
-              if (p.gold >= price) {
-                p.gold -= price;
-                this.state.tileOwner[pick] = p.id;
-                this.state.tilePrice[pick] = price;
-                changed = true;
-                break;
-              }
-            }
-          }
-        }
-      }
-      // build a farm or factory if has unimproved tiles
-      if (p.gold > 100) {
-        for (const tid of owned) {
-          const existing = buildingsOnTile(this.state, tid);
-          if (existing.length === 0) {
-            const type: BuildingType = Math.random() > 0.5 ? 'farm' : 'house';
-            const c = COSTS[type];
-            if (p.gold >= c.gold) {
-              p.gold -= c.gold;
-              this.state.buildings[uid('b')] = { id: uid('b'), tileId: tid, ownerId: p.id, type, level: 1, createdAt: Date.now() };
-              changed = true;
-            }
+      const parcel = parcelOfPlayer(this.state, p.id);
+      if (!parcel) continue;
+      for (const tid of parcel.tileIds) {
+        if (buildingsOnTile(this.state, tid).length === 0 && businessesOnTile(this.state, tid).length === 0 && p.gold > 80) {
+          const type: BuildingType = Math.random() > 0.5 ? 'farm' : 'house';
+          const c = COSTS[type];
+          if (p.gold >= c.gold) {
+            p.gold -= c.gold;
+            this.state.buildings[uid('b')] = { id: uid('b'), tileId: tid, ownerId: p.id, type, level: 1, createdAt: Date.now(), parcelId: parcel.id };
+            changed = true;
             break;
           }
         }
@@ -169,9 +131,21 @@ export class LocalStore implements DataStore {
     if (id) localStorage.setItem(PLAYER_KEY, id); else localStorage.removeItem(PLAYER_KEY);
   }
 
-  async createPlayer(name: string, color: string): Promise<string> {
+  async createPlayer(name: string, color: string, countryId: string): Promise<string> {
     const p = makePlayer(name, color, false);
+    const parcel = generateStarterParcel(this.state, countryId, p.id, name);
+    if (!parcel) throw new Error('Could not spawn in this country');
+    p.spawnCountryId = countryId;
+    p.parcelId = parcel.id;
     this.state.players[p.id] = p;
+
+    const homeTile = parcel.tileIds[Math.floor(parcel.tileIds.length / 2)];
+    const homeId = uid('b');
+    this.state.buildings[homeId] = {
+      id: homeId, tileId: homeTile, ownerId: p.id, type: 'home', level: 1,
+      createdAt: Date.now(), parcelId: parcel.id,
+    };
+
     this.setCurrentPlayerId(p.id);
     this.save(); this.notify();
     return p.id;
@@ -182,28 +156,18 @@ export class LocalStore implements DataStore {
     return id ? this.state.players[id] : null;
   }
 
-  async claimTile(tileId: number): Promise<boolean> {
-    const p = this.player(); if (!p) return false;
-    if (this.state.tileOwner[tileId]) return false;
-    const price = tilePriceFor(this.state, tileId);
-    if (p.gold < price) return false;
-    p.gold -= price;
-    this.state.tileOwner[tileId] = p.id;
-    this.state.tilePrice[tileId] = price;
-    this.save(); this.notify();
-    return true;
-  }
-
   async buildOnTile(tileId: number, type: BuildingType): Promise<boolean> {
     const p = this.player(); if (!p) return false;
-    if (this.state.tileOwner[tileId] !== p.id) return false;
+    if (!playerOwnsTile(this.state, p.id, tileId)) return false;
     if (buildingsOnTile(this.state, tileId).length > 0) return false;
+    if (businessesOnTile(this.state, tileId).length > 0) return false;
     const c = COSTS[type];
     if (p.gold < c.gold) return false;
     if (c.resources && p.resources < c.resources) return false;
     p.gold -= c.gold; if (c.resources) p.resources -= c.resources;
     const id = uid('b');
-    this.state.buildings[id] = { id, tileId, ownerId: p.id, type, level: 1, createdAt: Date.now() };
+    const parcel = parcelOfPlayer(this.state, p.id);
+    this.state.buildings[id] = { id, tileId, ownerId: p.id, type, level: 1, createdAt: Date.now(), parcelId: parcel?.id };
     this.save(); this.notify();
     return true;
   }
@@ -219,15 +183,79 @@ export class LocalStore implements DataStore {
     return true;
   }
 
-  async foundCity(name: string, centerTileId: number, tileIds: number[]): Promise<boolean> {
+  async createBusiness(name: string, type: string, tileId: number): Promise<boolean> {
     const p = this.player(); if (!p) return false;
-    const groups = contiguousGroups(this.state, p.id);
-    const ok = groups.some(g => g.length >= TOWN_THRESHOLD && g.includes(centerTileId));
-    if (!ok) return false;
-    const t = TILES.find(x => x.id === centerTileId);
-    if (!t) return false;
-    const id = uid('c');
-    this.state.cities[id] = { id, name, ownerId: p.id, countryId: t.country, centerTileId, tileIds, foundedAt: Date.now() };
+    if (!playerOwnsTile(this.state, p.id, tileId)) return false;
+    if (buildingsOnTile(this.state, tileId).length > 0) return false;
+    if (businessesOnTile(this.state, tileId).length > 0) return false;
+    if (p.gold < 150) return false;
+    const parcel = parcelOfPlayer(this.state, p.id);
+    if (!parcel) return false;
+    p.gold -= 150;
+    const biz = makeBusiness(p.id, parcel.id, name, type, tileId);
+    this.state.businesses[biz.id] = biz;
+    this.save(); this.notify();
+    return true;
+  }
+
+  async hireStaff(businessId: string, name: string, role: string): Promise<boolean> {
+    const p = this.player(); if (!p) return false;
+    const biz = this.state.businesses[businessId];
+    if (!biz || biz.ownerId !== p.id) return false;
+    if (p.gold < 50) return false;
+    p.gold -= 50;
+    const st = makeStaff(businessId, p.id, name, role);
+    this.state.staff[st.id] = st;
+    biz.staffIds.push(st.id);
+    this.save(); this.notify();
+    return true;
+  }
+
+  async fireStaff(staffId: string): Promise<boolean> {
+    const p = this.player(); if (!p) return false;
+    const st = this.state.staff[staffId];
+    if (!st || st.ownerId !== p.id) return false;
+    const biz = this.state.businesses[st.businessId];
+    if (biz) biz.staffIds = biz.staffIds.filter(id => id !== staffId);
+    delete this.state.staff[staffId];
+    this.save(); this.notify();
+    return true;
+  }
+
+  async updateStaffCommand(staffId: string, commandId: string, updates: Partial<DoCommand>): Promise<boolean> {
+    const p = this.player(); if (!p) return false;
+    const st = this.state.staff[staffId];
+    if (!st || st.ownerId !== p.id) return false;
+    const cmd = st.commands.find(c => c.id === commandId);
+    if (!cmd) return false;
+    Object.assign(cmd, updates);
+    this.save(); this.notify();
+    return true;
+  }
+
+  async addStaffCommand(staffId: string, verb: DoVerb): Promise<boolean> {
+    const p = this.player(); if (!p) return false;
+    const st = this.state.staff[staffId];
+    if (!st || st.ownerId !== p.id) return false;
+    addCommandToStaff(st, verb);
+    this.save(); this.notify();
+    return true;
+  }
+
+  async removeStaffCommand(staffId: string, commandId: string): Promise<boolean> {
+    const p = this.player(); if (!p) return false;
+    const st = this.state.staff[staffId];
+    if (!st || st.ownerId !== p.id) return false;
+    st.commands = st.commands.filter(c => c.id !== commandId);
+    this.save(); this.notify();
+    return true;
+  }
+
+  async updateBusinessConfig(businessId: string, config: Record<string, string | number | boolean>): Promise<boolean> {
+    const p = this.player(); if (!p) return false;
+    const biz = this.state.businesses[businessId];
+    if (!biz || biz.ownerId !== p.id) return false;
+    biz.config = { ...biz.config, ...config };
     this.save(); this.notify();
     return true;
   }

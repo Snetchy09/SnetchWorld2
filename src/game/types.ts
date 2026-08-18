@@ -1,4 +1,31 @@
-export type BuildingType = 'house' | 'farm' | 'factory' | 'store' | 'road';
+export type BuildingType = 'house' | 'farm' | 'factory' | 'store' | 'road' | 'home';
+
+export type DoVerb =
+  | 'cash_customer'
+  | 'restock'
+  | 'repair'
+  | 'auto_place'
+  | 'clean'
+  | 'deliver'
+  | 'produce'
+  | 'serve'
+  | 'collect'
+  | 'organize'
+  | 'greet'
+  | 'pack'
+  | 'price_check'
+  | 'inventory_count';
+
+export interface DoCommand {
+  id: string;
+  verb: DoVerb;
+  label: string;
+  target?: string;
+  params: Record<string, string | number | boolean>;
+  priority: number;
+  enabled: boolean;
+  autoRepeat: boolean;
+}
 
 export interface Tile {
   id: number;
@@ -16,6 +43,17 @@ export interface CountryDef {
   tileCount: number;
 }
 
+export interface LandParcel {
+  id: string;
+  ownerId: string;
+  countryId: string;
+  name: string;
+  tileIds: number[];
+  centerLat: number;
+  centerLng: number;
+  createdAt: number;
+}
+
 export interface Building {
   id: string;
   tileId: number;
@@ -23,6 +61,36 @@ export interface Building {
   type: BuildingType;
   level: number;
   createdAt: number;
+  parcelId?: string;
+}
+
+export interface Business {
+  id: string;
+  ownerId: string;
+  parcelId: string;
+  name: string;
+  type: string;
+  tileId: number;
+  cash: number;
+  inventory: Record<string, number>;
+  staffIds: string[];
+  level: number;
+  config: Record<string, string | number | boolean>;
+  createdAt: number;
+}
+
+export interface Staff {
+  id: string;
+  businessId: string;
+  ownerId: string;
+  name: string;
+  role: string;
+  salary: number;
+  skills: string[];
+  commands: DoCommand[];
+  currentTask: string | null;
+  efficiency: number;
+  hiredAt: number;
 }
 
 export interface Player {
@@ -36,6 +104,8 @@ export interface Player {
   isAI: boolean;
   lastTickAt: number;
   createdAt: number;
+  spawnCountryId: string | null;
+  parcelId: string | null;
 }
 
 export interface City {
@@ -64,8 +134,8 @@ export interface CountryState {
 
 export interface War {
   id: string;
-  attackerId: string;   // country id
-  defenderId: string;   // country id
+  attackerId: string;
+  defenderId: string;
   attackerStrength: number;
   defenderStrength: number;
   startTick: number;
@@ -96,8 +166,11 @@ export interface GameState {
   wars: Record<string, War>;
   tradeOffers: Record<string, TradeOffer>;
   market: MarketPrice;
-  tileOwner: Record<number, string>;     // tileId -> playerId
+  tileOwner: Record<number, string>;
   tilePrice: Record<number, number>;
+  parcels: Record<string, LandParcel>;
+  businesses: Record<string, Business>;
+  staff: Record<string, Staff>;
 }
 
 export interface PlayerSummary {
@@ -122,17 +195,49 @@ export interface CountrySummary {
   cityCount: number;
 }
 
+export const DO_VERB_LABELS: Record<DoVerb, string> = {
+  cash_customer: 'Cash out customers',
+  restock: 'Restock shelves',
+  repair: 'Repair equipment',
+  auto_place: 'Auto-place items',
+  clean: 'Clean area',
+  deliver: 'Deliver goods',
+  produce: 'Produce goods',
+  serve: 'Serve customers',
+  collect: 'Collect payments',
+  organize: 'Organize stock',
+  greet: 'Greet visitors',
+  pack: 'Pack orders',
+  price_check: 'Update prices',
+  inventory_count: 'Count inventory',
+};
+
+export const DEFAULT_DO_COMMANDS: Omit<DoCommand, 'id'>[] = [
+  { verb: 'cash_customer', label: 'Cash out customers', params: {}, priority: 1, enabled: true, autoRepeat: true },
+  { verb: 'restock', label: 'Restock when low', params: { threshold: 5 }, priority: 2, enabled: true, autoRepeat: true },
+  { verb: 'repair', label: 'Repair when broken', params: {}, priority: 3, enabled: false, autoRepeat: true },
+  { verb: 'auto_place', label: 'Auto-place new items', params: {}, priority: 4, enabled: false, autoRepeat: true },
+  { verb: 'clean', label: 'Keep area clean', params: {}, priority: 5, enabled: true, autoRepeat: true },
+  { verb: 'serve', label: 'Serve customers', params: {}, priority: 1, enabled: true, autoRepeat: true },
+  { verb: 'greet', label: 'Greet visitors', params: {}, priority: 6, enabled: true, autoRepeat: true },
+];
+
 export interface DataStore {
   mode: 'solo' | 'multiplayer';
   getState(): Promise<GameState>;
   subscribe(cb: (s: GameState) => void): () => void;
-  createPlayer(name: string, color: string): Promise<string>;
+  createPlayer(name: string, color: string, countryId: string): Promise<string>;
   getCurrentPlayerId(): string | null;
   setCurrentPlayerId(id: string | null): void;
-  claimTile(tileId: number): Promise<boolean>;
   buildOnTile(tileId: number, type: BuildingType): Promise<boolean>;
   upgradeBuilding(buildingId: string): Promise<boolean>;
-  foundCity(name: string, centerTileId: number, tileIds: number[]): Promise<boolean>;
+  createBusiness(name: string, type: string, tileId: number): Promise<boolean>;
+  hireStaff(businessId: string, name: string, role: string): Promise<boolean>;
+  fireStaff(staffId: string): Promise<boolean>;
+  updateStaffCommand(staffId: string, commandId: string, updates: Partial<DoCommand>): Promise<boolean>;
+  addStaffCommand(staffId: string, verb: DoVerb): Promise<boolean>;
+  removeStaffCommand(staffId: string, commandId: string): Promise<boolean>;
+  updateBusinessConfig(businessId: string, config: Record<string, string | number | boolean>): Promise<boolean>;
   setTaxRate(countryId: string, rate: number): Promise<boolean>;
   declareWar(attackerId: string, defenderId: string): Promise<boolean>;
   fundProject(countryId: string, projectId: string): Promise<boolean>;

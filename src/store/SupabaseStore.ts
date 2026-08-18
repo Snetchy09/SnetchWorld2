@@ -1,14 +1,16 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type {
   DataStore, GameState, Player, BuildingType, TradeOffer,
-  PlayerSummary, CountrySummary,
+  PlayerSummary, CountrySummary, DoCommand, DoVerb,
 } from '../game/types';
 import {
   newGameState, runTick, ensureCountriesPresent, makePlayer,
-  uid, COSTS, UPGRADE_COST_MULT, tilePriceFor, tilesOwnedBy,
-  contiguousGroups, TOWN_THRESHOLD, WAR_COST, PROJECTS,
-  computeLeaderboards, buildingsOnTile, TILES, COUNTRIES, baseTilePrice,
+  uid, COSTS, UPGRADE_COST_MULT, tilesOwnedBy,
+  WAR_COST, PROJECTS,
+  computeLeaderboards, buildingsOnTile, TILES, COUNTRIES,
+  generateStarterParcel, parcelOfPlayer, playerOwnsTile, businessesOnTile,
 } from '../game/engine';
+import { makeBusiness, makeStaff, addCommandToStaff } from '../game/businessEngine';
 
 const supabaseUrl = (import.meta as any).env?.VITE_SUPABASE_URL as string | undefined;
 const supabaseAnon = (import.meta as any).env?.VITE_SUPABASE_ANON_KEY as string | undefined;
@@ -86,6 +88,9 @@ export class SupabaseStore implements DataStore {
     }
     for (const o of owners.data || []) this.state.tileOwner[o.tile_id] = o.player_id;
     for (const pr of prices.data || []) this.state.tilePrice[pr.tile_id] = pr.price;
+    if (!this.state.parcels) this.state.parcels = {};
+    if (!this.state.businesses) this.state.businesses = {};
+    if (!this.state.staff) this.state.staff = {};
     this.notify();
   }
 
@@ -134,12 +139,23 @@ export class SupabaseStore implements DataStore {
   getCurrentPlayerId(): string | null { return this.playerId; }
   setCurrentPlayerId(id: string | null): void { this.playerId = id; localStorage.setItem('territoria_mp_player', id || ''); }
 
-  async createPlayer(name: string, color: string): Promise<string> {
+  async createPlayer(name: string, color: string, countryId: string): Promise<string> {
     await this.ready;
     const p = makePlayer(name, color, false);
+    const parcel = generateStarterParcel(this.state, countryId, p.id, name);
+    if (!parcel) throw new Error('Could not spawn in this country');
+    p.spawnCountryId = countryId;
+    p.parcelId = parcel.id;
     const { data, error } = await this.sb.from('players').insert({ id:p.id, name:p.name, color:p.color, gold:p.gold, food:p.food, resources:p.resources, population:p.population, is_ai:p.isAI }).select().single();
     if (error) throw error;
     this.state.players[data.id] = p;
+    for (const tid of parcel.tileIds) {
+      await this.sb.from('tile_owners').insert({ tile_id: tid, player_id: p.id });
+    }
+    const homeTile = parcel.tileIds[Math.floor(parcel.tileIds.length / 2)];
+    const homeId = uid('b');
+    this.state.buildings[homeId] = { id: homeId, tileId: homeTile, ownerId: p.id, type: 'home', level: 1, createdAt: Date.now(), parcelId: parcel.id };
+    await this.sb.from('buildings').insert({ id: homeId, tile_id: homeTile, owner_id: p.id, type: 'home', level: 1 });
     this.setCurrentPlayerId(data.id);
     this.notify();
     return data.id;
@@ -150,35 +166,21 @@ export class SupabaseStore implements DataStore {
     return id ? this.state.players[id] : null;
   }
 
-  async claimTile(tileId: number): Promise<boolean> {
-    const p = this.player(); if (!p) return false;
-    if (this.state.tileOwner[tileId]) return false;
-    const price = tilePriceFor(this.state, tileId);
-    if (p.gold < price) return false;
-    const { error } = await this.sb.from('tile_owners').insert({ tile_id:tileId, player_id:p.id });
-    if (error) return false;
-    await this.sb.from('tile_prices').upsert({ tile_id:tileId, price });
-    await this.sb.from('players').update({ gold: p.gold - price }).eq('id', p.id);
-    p.gold -= price;
-    this.state.tileOwner[tileId] = p.id;
-    this.state.tilePrice[tileId] = price;
-    this.notify();
-    return true;
-  }
-
   async buildOnTile(tileId: number, type: BuildingType): Promise<boolean> {
     const p = this.player(); if (!p) return false;
-    if (this.state.tileOwner[tileId] !== p.id) return false;
+    if (!playerOwnsTile(this.state, p.id, tileId)) return false;
     if (buildingsOnTile(this.state, tileId).length > 0) return false;
+    if (businessesOnTile(this.state, tileId).length > 0) return false;
     const c = COSTS[type];
     if (p.gold < c.gold) return false;
     if (c.resources && p.resources < c.resources) return false;
     const id = uid('b');
+    const parcel = parcelOfPlayer(this.state, p.id);
     const { error } = await this.sb.from('buildings').insert({ id, tile_id:tileId, owner_id:p.id, type, level:1 });
     if (error) return false;
     await this.sb.from('players').update({ gold: p.gold - c.gold, resources: p.resources - (c.resources||0) }).eq('id', p.id);
     p.gold -= c.gold; if (c.resources) p.resources -= c.resources;
-    this.state.buildings[id] = { id, tileId, ownerId:p.id, type, level:1, createdAt:Date.now() };
+    this.state.buildings[id] = { id, tileId, ownerId:p.id, type, level:1, createdAt:Date.now(), parcelId: parcel?.id };
     this.notify();
     return true;
   }
@@ -196,17 +198,79 @@ export class SupabaseStore implements DataStore {
     return true;
   }
 
-  async foundCity(name: string, centerTileId: number, tileIds: number[]): Promise<boolean> {
+  async createBusiness(name: string, type: string, tileId: number): Promise<boolean> {
     const p = this.player(); if (!p) return false;
-    const groups = contiguousGroups(this.state, p.id);
-    const ok = groups.some(g => g.length >= TOWN_THRESHOLD && g.includes(centerTileId));
-    if (!ok) return false;
-    const t = TILES.find(x => x.id === centerTileId);
-    if (!t) return false;
-    const id = uid('c');
-    const { error } = await this.sb.from('cities').insert({ id, name, owner_id:p.id, country_id:t.country, center_tile_id:centerTileId, tile_ids:tileIds });
-    if (error) return false;
-    this.state.cities[id] = { id, name, ownerId:p.id, countryId:t.country, centerTileId, tileIds, foundedAt:Date.now() };
+    if (!playerOwnsTile(this.state, p.id, tileId)) return false;
+    if (buildingsOnTile(this.state, tileId).length > 0) return false;
+    if (businessesOnTile(this.state, tileId).length > 0) return false;
+    if (p.gold < 150) return false;
+    const parcel = parcelOfPlayer(this.state, p.id);
+    if (!parcel) return false;
+    p.gold -= 150;
+    const biz = makeBusiness(p.id, parcel.id, name, type, tileId);
+    this.state.businesses[biz.id] = biz;
+    this.notify();
+    return true;
+  }
+
+  async hireStaff(businessId: string, name: string, role: string): Promise<boolean> {
+    const p = this.player(); if (!p) return false;
+    const biz = this.state.businesses[businessId];
+    if (!biz || biz.ownerId !== p.id) return false;
+    if (p.gold < 50) return false;
+    p.gold -= 50;
+    const st = makeStaff(businessId, p.id, name, role);
+    this.state.staff[st.id] = st;
+    biz.staffIds.push(st.id);
+    this.notify();
+    return true;
+  }
+
+  async fireStaff(staffId: string): Promise<boolean> {
+    const p = this.player(); if (!p) return false;
+    const st = this.state.staff[staffId];
+    if (!st || st.ownerId !== p.id) return false;
+    const biz = this.state.businesses[st.businessId];
+    if (biz) biz.staffIds = biz.staffIds.filter(id => id !== staffId);
+    delete this.state.staff[staffId];
+    this.notify();
+    return true;
+  }
+
+  async updateStaffCommand(staffId: string, commandId: string, updates: Partial<DoCommand>): Promise<boolean> {
+    const p = this.player(); if (!p) return false;
+    const st = this.state.staff[staffId];
+    if (!st || st.ownerId !== p.id) return false;
+    const cmd = st.commands.find(c => c.id === commandId);
+    if (!cmd) return false;
+    Object.assign(cmd, updates);
+    this.notify();
+    return true;
+  }
+
+  async addStaffCommand(staffId: string, verb: DoVerb): Promise<boolean> {
+    const p = this.player(); if (!p) return false;
+    const st = this.state.staff[staffId];
+    if (!st || st.ownerId !== p.id) return false;
+    addCommandToStaff(st, verb);
+    this.notify();
+    return true;
+  }
+
+  async removeStaffCommand(staffId: string, commandId: string): Promise<boolean> {
+    const p = this.player(); if (!p) return false;
+    const st = this.state.staff[staffId];
+    if (!st || st.ownerId !== p.id) return false;
+    st.commands = st.commands.filter(c => c.id !== commandId);
+    this.notify();
+    return true;
+  }
+
+  async updateBusinessConfig(businessId: string, config: Record<string, string | number | boolean>): Promise<boolean> {
+    const p = this.player(); if (!p) return false;
+    const biz = this.state.businesses[businessId];
+    if (!biz || biz.ownerId !== p.id) return false;
+    biz.config = { ...biz.config, ...config };
     this.notify();
     return true;
   }
